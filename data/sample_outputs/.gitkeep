@@ -1,0 +1,6 @@
+
+# This file ensures the directory is tracked by git even when empty
+# Place this file in:
+# - data/sample_output/.gitkeep
+# - data/benchmarks/.gitkeep  
+# - figures/.gitkeep

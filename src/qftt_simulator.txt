@@ -1,0 +1,348 @@
+"""
+QFTT Bootstrap Loop Simulator
+
+Core simulation engine for the 3-qubit QFTT model implementing spontaneous
+collapse events based on clock time uncertainty.
+
+© 2024 - MIT License
+"""
+
+import numpy as np
+import pandas as pd
+from qutip import basis, tensor, sigmax, sigmaz, sigmap, sigmam, Qobj, entropy_vn
+from typing import Optional, Dict, List
+import warnings
+
+
+class QFTTSimulator:
+    """
+    Simulator for the QFTT Bootstrap Loop in a 3-qubit Clock-System-Environment model.
+    
+    This implements a Wheeler-DeWitt type universe where time emerges through
+    spontaneous collapses triggered by clock time uncertainty.
+    
+    Parameters
+    ----------
+    Omega : float, default=1.0
+        Energy splitting for the clock and system qubits (in same units, 
+        ensures H_clock + H_system ≈ 0 initially).
+    g : float, default=0.2
+        Coupling strength between clock (time field) and system 
+        (interaction Hamiltonian coefficient).
+    lambda_se : float, default=0.1
+        Coupling strength between system and environment (dissipative exchange).
+    dt : float, default=0.05
+        Time step for state evolution.
+    threshold : float, default=0.5
+        Collapse trigger threshold for <(ΔT)^2> (between 0 and 1).
+    max_events : int, default=1000
+        Number of collapse events to record before stopping.
+    reset_environment : bool, default=True
+        Whether to reset environment to |0> after each collapse.
+        True = fresh environment each time (arrow of time emerges)
+        False = no reset (entropy saturates)
+    """
+    
+    def __init__(self, 
+                 Omega: float = 1.0, 
+                 g: float = 0.2, 
+                 lambda_se: float = 0.1,
+                 dt: float = 0.05, 
+                 threshold: float = 0.5, 
+                 max_events: int = 1000, 
+                 t_max: float = 200.0,
+                 reset_environment: bool = True):
+        
+        # Initialize parameters
+        self.Omega = Omega
+        self.g = g
+        self.lambda_se = lambda_se
+        self.dt = dt
+        self.threshold = threshold
+        self.max_events = max_events
+        self.t_max = t_max
+        self.reset_environment = reset_environment
+        
+        # Validate parameters
+        self._validate_parameters()
+        
+        # Set up static operators (Pauli matrices, basis states)
+        self._define_operators()
+        
+        # Build Hamiltonian
+        self._build_hamiltonian()
+        
+        # Prepare initial state
+        self._prepare_initial_state()
+        
+        # Store initial total energy for verification
+        self.initial_energy = np.real((self.psi0.dag() * (self.H_tot * self.psi0))[0, 0])
+        
+        print(f"Initial total energy: {self.initial_energy:.6f} (should be ≈ 0)")
+        
+    def _validate_parameters(self):
+        """Validate input parameters."""
+        if self.threshold < 0 or self.threshold > 1:
+            raise ValueError("threshold must be between 0 and 1")
+        if self.dt <= 0:
+            raise ValueError("dt must be positive")
+        if self.max_events <= 0:
+            raise ValueError("max_events must be positive")
+        if self.t_max <= 0:
+            raise ValueError("t_max must be positive")
+            
+    def _define_operators(self):
+        """Define basis states and operators (Pauli matrices, tensor products for 3 qubits)."""
+        # Single qubit basis
+        zero = basis(2, 0)
+        one = basis(2, 1)
+        self.zero, self.one = zero, one
+        
+        # Pauli matrices
+        sx = sigmax()
+        sz = sigmaz()
+        sm = sigmam()
+        sp = sigmap()
+        
+        # Tensor identities
+        Ic = Qobj(np.eye(2))
+        Is = Qobj(np.eye(2))
+        Ie = Qobj(np.eye(2))
+        
+        # Clock operators
+        self.sx_c = tensor(sx, Is, Ie)  # Clock time operator
+        self.sz_c = tensor(sz, Is, Ie)  # Clock energy operator
+        
+        # System operators
+        self.sz_s = tensor(Ic, sz, Ie)  # System energy
+        self.sm_s = tensor(Ic, sm, Ie)  # System lowering
+        self.sp_s = tensor(Ic, sp, Ie)  # System raising
+        
+        # Environment operators
+        self.sz_e = tensor(Ic, Is, sz)  # Environment energy
+        self.sm_e = tensor(Ic, Is, sm)  # Environment lowering
+        self.sp_e = tensor(Ic, Is, sp)  # Environment raising
+        
+        # Identity for full system
+        self.I_tot = tensor(Ic, Is, Ie)
+        
+    def _build_hamiltonian(self):
+        """Construct the total Hamiltonian H_tot = H_clock + H_system + H_env + H_int + H_se."""
+        # Clock, System, Environment Hamiltonians (two-level systems with ±Ω/2 energies)
+        H_clock = 0.5 * self.Omega * self.sz_c
+        H_system = 0.5 * self.Omega * self.sz_s
+        H_env = 0.5 * self.Omega * self.sz_e  # environment splitting
+        
+        # Interaction Hamiltonians
+        H_int = self.g * self.sx_c * self.sz_s  # clock-system coupling
+        H_se = self.lambda_se * (self.sm_s * self.sp_e + self.sp_s * self.sm_e)  # system-env coupling
+        
+        # Total Hamiltonian (Qobj)
+        self.H_tot = H_clock + H_system + H_env + H_int + H_se
+        
+        # Store components for analysis
+        self.H_clock = H_clock
+        self.H_system = H_system
+        self.H_env = H_env
+        self.H_int = H_int
+        self.H_se = H_se
+        
+    def _prepare_initial_state(self):
+        """Initialize the 3-qubit state as an entangled clock-system state with environment in |0>."""
+        # Branch states: |0_c, 1_s, 0_e> and |1_c, 0_s, 0_e>
+        psi_branch1 = tensor(self.zero, self.one, self.zero)
+        psi_branch2 = tensor(self.one, self.zero, self.zero)
+        
+        # Normalized superposition - creates Wheeler-DeWitt state with total energy ≈ 0
+        self.psi0 = (psi_branch1 + psi_branch2).unit()
+        self.state = self.psi0  # current state vector (Qobj ket)
+        self.t = 0.0  # current time
+        self.events = []  # list to record events
+        
+    def run(self, random_seed: Optional[int] = 42) -> pd.DataFrame:
+        """
+        Run the simulation loop until max_events or t_max is reached.
+        
+        Parameters
+        ----------
+        random_seed : int or None, default=42
+            Random seed for reproducibility. Set to None for non-deterministic behavior.
+            
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame containing all collapse events with columns:
+            event_id, event_type, eigentime, delta_t, entropy, energy, 
+            collapse_basis, system_state
+        """
+        if random_seed is not None:
+            np.random.seed(random_seed)
+            print(f"Random seed set to: {random_seed}")
+            
+        # Precompute operators for measuring time uncertainty
+        T_op = self.sx_c  # clock "time" operator (σ^x_c)
+        T2_op = self.sx_c * self.sx_c  # (σ^x_c)^2 = I
+        
+        last_collapse_t = 0.0
+        event_count = 0
+        
+        # For progress tracking
+        progress_milestones = [0.1, 0.25, 0.5, 0.75, 0.9]
+        next_milestone_idx = 0
+        
+        print(f"Starting simulation (max {self.max_events} events, max time {self.t_max})...")
+        
+        # Evolve until collapse events are collected
+        while event_count < self.max_events and self.t < self.t_max:
+            # Time evolution for one step
+            U_dt = (-1j * self.H_tot * self.dt).expm()  # propagator exp(-iH dt)
+            self.state = U_dt * self.state
+            self.t += self.dt
+            
+            # Compute time-operator variance ΔT^2
+            exp_T = np.real((self.state.dag() * (T_op * self.state))[0, 0])
+            exp_T2 = np.real((self.state.dag() * (T2_op * self.state))[0, 0])
+            DeltaT2 = exp_T2 - exp_T**2
+            
+            # Check collapse condition
+            if DeltaT2 > self.threshold:
+                # Collapse occurs
+                event_count += 1
+                
+                # Determine random collapse outcome (+ or - eigenstate of σ^x_c)
+                plus_state = (self.zero + self.one).unit()
+                minus_state = (self.zero - self.one).unit()
+                
+                # Calculate probability for + outcome
+                proj_plus = tensor(plus_state * plus_state.dag(), Qobj(np.eye(2)), Qobj(np.eye(2)))
+                P_plus = np.real((self.state.dag() * (proj_plus * self.state))[0, 0])
+                
+                # Random collapse
+                outcome_plus = (np.random.rand() < P_plus)
+                
+                if outcome_plus:
+                    # Project onto |+>_x and renormalize
+                    self.state = (proj_plus * self.state) / np.sqrt(P_plus)
+                    eigentime_val = 1.0
+                else:
+                    # Project onto |->_x and renormalize
+                    proj_minus = tensor(minus_state * minus_state.dag(), Qobj(np.eye(2)), Qobj(np.eye(2)))
+                    self.state = (proj_minus * self.state) / np.sqrt(1 - P_plus)
+                    eigentime_val = -1.0
+                    
+                current_time = self.t
+                delta_t = current_time - last_collapse_t if event_count > 1 else current_time
+                last_collapse_t = current_time
+                
+                # Calculate system entropy and energy after collapse
+                rho_full = self.state * self.state.dag()  # density matrix of full system
+                rho_system = rho_full.ptrace(1)  # partial trace to get system's state
+                S_system = entropy_vn(rho_system, base=2)
+                E_system = np.real((self.state.dag() * (self.H_system * self.state))[0, 0])
+                
+                # Compute system state probabilities for logging
+                P0 = np.real(rho_system[0, 0])
+                P1 = np.real(rho_system[1, 1])
+                system_state_str = f"P(0)={P0:.3f}, P(1)={P1:.3f}"
+                
+                # Log the event
+                self.events.append({
+                    "event_id": event_count,
+                    "event_type": "T_collapse",
+                    "eigentime": eigentime_val,
+                    "delta_t": float(delta_t),
+                    "entropy": float(S_system),
+                    "energy": float(E_system),
+                    "collapse_basis": "clock_T_eigenbasis",
+                    "system_state": system_state_str
+                })
+                
+                # Reset environment (project environment qubit to |0>)
+                if self.reset_environment:
+                    proj_env0 = tensor(Qobj(np.eye(2)), Qobj(np.eye(2)), self.zero * self.zero.dag())
+                    self.state = proj_env0 * self.state
+                    self.state = self.state / self.state.norm()  # renormalize the state vector
+                # else: No environment reset (Option A - no fresh environment)
+                
+                # Progress update
+                if next_milestone_idx < len(progress_milestones):
+                    progress = event_count / self.max_events
+                    if progress >= progress_milestones[next_milestone_idx]:
+                        print(f"Progress: {int(progress * 100)}% ({event_count} events)")
+                        next_milestone_idx += 1
+                        
+        # End of loop
+        print(f"\nSimulation complete. {event_count} collapse events recorded.")
+        
+        # Convert events to DataFrame
+        df = pd.DataFrame(self.events, columns=["event_id", "event_type", "eigentime", "delta_t",
+                                                "entropy", "energy", "collapse_basis", "system_state"])
+        
+        # Save outputs
+        df.to_csv("qftt_events.csv", index=False)
+        df.to_hdf("qftt_events.h5", key="events", mode="w")
+        
+        print(f"Data saved to qftt_events.csv and qftt_events.h5")
+        
+        # Print summary statistics
+        if len(df) > 0:
+            print(f"\nSummary statistics:")
+            print(f"  Average Δt: {df['delta_t'].mean():.3f} ± {df['delta_t'].std():.3f}")
+            print(f"  Final entropy: {df.iloc[-1]['entropy']:.3f} bits")
+            print(f"  Eigentime balance: +1: {(df['eigentime'] == 1).sum()}, -1: {(df['eigentime'] == -1).sum()}")
+            
+        return df
+    
+    def get_state_info(self) -> Dict:
+        """
+        Get current state information for debugging/analysis.
+        
+        Returns
+        -------
+        dict
+            Dictionary containing current time, state vector, and various expectation values
+        """
+        rho_full = self.state * self.state.dag()
+        rho_clock = rho_full.ptrace(0)
+        rho_system = rho_full.ptrace(1)
+        rho_env = rho_full.ptrace(2)
+        
+        return {
+            "time": self.t,
+            "clock_entropy": entropy_vn(rho_clock, base=2),
+            "system_entropy": entropy_vn(rho_system, base=2),
+            "env_entropy": entropy_vn(rho_env, base=2),
+            "total_energy": np.real((self.state.dag() * (self.H_tot * self.state))[0, 0]),
+            "clock_time_exp": np.real((self.state.dag() * (self.sx_c * self.state))[0, 0]),
+            "time_uncertainty": self._compute_time_uncertainty()
+        }
+        
+    def _compute_time_uncertainty(self) -> float:
+        """Compute current time uncertainty ΔT^2."""
+        T_op = self.sx_c
+        exp_T = np.real((self.state.dag() * (T_op * self.state))[0, 0])
+        exp_T2 = 1.0  # Since (σ^x)^2 = I
+        return exp_T2 - exp_T**2
+
+
+# Convenience function for quick runs
+def run_quick_simulation(n_events: int = 100, **kwargs) -> pd.DataFrame:
+    """
+    Run a quick simulation with specified number of events.
+    
+    Parameters
+    ----------
+    n_events : int, default=100
+        Number of events to simulate
+    **kwargs : dict
+        Additional parameters to pass to QFTTSimulator
+        
+    Returns
+    -------
+    pd.DataFrame
+        Event data
+    """
+    sim_params = {"max_events": n_events}
+    sim_params.update(kwargs)
+    sim = QFTTSimulator(**sim_params)
+    return sim.run()
